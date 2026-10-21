@@ -164,3 +164,56 @@ if (!forecast.safe) {
 // Throws TreasuryForecastError with the first breaching asset when unsafe.
 assertTreasuryLiquiditySafe(forecast);
 ```
+
+## Payout Totals After a Partial Retry (#813)
+
+Retrying only the failed items in a partially successful batch must not double-count items that already settled. `recalculatePayoutTotalsAfterRetry` replays the original attempt and every retry in order and returns the settled total, the amount recovered by retries, and the amount still outstanding, both in aggregate and per asset.
+
+Each item is counted at most once. Items that settled on attempt `1` are final; retries that report them again are rejected with `DUPLICATE_SUCCESS` or `SETTLED_OUTCOME_REVERSED` instead of inflating the total. Validation issues are privacy-safe: item identifiers are masked and amounts, salaries, recipients, and raw employee IDs never appear in errors.
+
+```typescript
+import { recalculatePayoutTotalsAfterRetry } from '@zk-payroll/core';
+
+const totals = recalculatePayoutTotalsAfterRetry({
+  entries: [
+    { itemId: 'line-1', amount: 1_000n, asset: 'USDC' },
+    { itemId: 'line-2', amount: 2_500n, asset: 'USDC' },
+  ],
+  attempts: [
+    {
+      attempt: 1,
+      outcomes: [
+        { itemId: 'line-1', outcome: 'succeeded' },
+        { itemId: 'line-2', outcome: 'failed' },
+      ],
+    },
+    { attempt: 2, outcomes: [{ itemId: 'line-2', outcome: 'succeeded' }] },
+  ],
+});
+
+console.log(totals.totalAmount); // 3_500n
+console.log(totals.recoveredAmount); // 2_500n
+```
+
+See [partial-retry-payout-totals.md](../packages/core/docs/partial-retry-payout-totals.md) for the full reference.
+
+## Paused Contract Reserve Release Guard (#814)
+
+Treasury reserve releases must not be submitted while the payroll contract is paused. `validateTreasuryReserveRelease` accepts an optional decoded pause state and rejects the release with `TREASURY_RESERVE_CONTRACT_PAUSED` when the contract is paused globally or when the `reservations` or `withdrawals` category is paused. `assertTreasuryReserveReleaseNotPaused` lets callers fail fast before building a request.
+
+The rejection is actionable and privacy-safe: it names the public pause state and remediation only, never amounts, salaries, or employee data. Unrelated categories (for example `payroll` or `proofs`) do not block reserve releases.
+
+```typescript
+import {
+  assertTreasuryReserveReleaseNotPaused,
+  validateTreasuryReserveRelease,
+} from '@zk-payroll/core';
+
+assertTreasuryReserveReleaseNotPaused({ isPaused: true });
+// throws TreasuryReserveReleaseValidationError: TREASURY_RESERVE_CONTRACT_PAUSED
+
+const result = validateTreasuryReserveRelease(request, reserve, Date.now(), {}, {
+  pausedCategories: ['reservations'],
+});
+// throws until the reservations pause is lifted
+```

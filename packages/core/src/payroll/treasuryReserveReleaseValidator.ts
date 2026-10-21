@@ -4,7 +4,12 @@
  * Validates that a treasury reserve release request is well-formed and
  * safe to execute before it is submitted on-chain. This guards operational
  * reliability by rejecting releases that would overwithdraw the reserve,
- * target an unknown reserve, or execute after expiry.
+ * target an unknown reserve, execute after expiry, or run while the payroll
+ * contract is paused.
+ *
+ * ## Privacy & Security Guarantees
+ * - Pause rejections only expose reserve IDs and public pause categories;
+ *   they never contain amounts, salaries, or employee identifiers.
  */
 
 import type { ErrorContext } from "../core/errors";
@@ -36,6 +41,32 @@ export interface TreasuryReserveSnapshot {
   /** Optional owner address of the reserve. */
   owner?: string;
 }
+
+/**
+ * Contract pause state used to block reserve releases while the payroll
+ * contract is paused (#814).
+ *
+ * Mirrors the normalized pause status exposed by the SDK pause module, but is
+ * intentionally structural so callers can pass decoded contract state without
+ * importing another module.
+ */
+export interface TreasuryReserveContractPauseState {
+  /** `true` when the contract is paused for every operation. */
+  isPaused?: boolean;
+  /** Operation categories currently paused (e.g. `"reservations"`). */
+  pausedCategories?: readonly string[];
+}
+
+/** Pause categories that block treasury reserve releases. */
+export const TREASURY_RESERVE_RELEASE_BLOCKED_PAUSE_CATEGORIES = [
+  "reservations",
+  "withdrawals",
+] as const;
+
+/** Message returned when a reserve release is attempted during a pause. */
+export const TREASURY_RESERVE_RELEASE_PAUSED_MESSAGE =
+  "Treasury reserve releases are blocked while the payroll contract is paused. " +
+  "Wait until the contract is resumed before retrying the release.";
 
 /**
  * A request to release funds from a treasury reserve.
@@ -70,6 +101,7 @@ export const TreasuryReserveReleaseValidationErrorCode = {
   INVALID_STATUS: "TREASURY_RESERVE_INVALID_STATUS",
   EXPIRED: "TREASURY_RESERVE_EXPIRED",
   UNAUTHORIZED: "TREASURY_RESERVE_UNAUTHORIZED",
+  CONTRACT_PAUSED: "TREASURY_RESERVE_CONTRACT_PAUSED",
 } as const;
 
 export type TreasuryReserveReleaseValidationErrorCode =
@@ -127,6 +159,70 @@ function normalizeRoles(roles: unknown): string[] {
   return roles.map((role) => String(role).toUpperCase());
 }
 
+function normalizePausedCategories(state?: TreasuryReserveContractPauseState | null): string[] {
+  if (!state || !Array.isArray(state.pausedCategories)) {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      state.pausedCategories
+        .map((category) => String(category).trim().toLowerCase())
+        .filter((category) => category.length > 0)
+    )
+  ).sort();
+}
+
+/**
+ * Whether reserve releases are currently blocked by a contract pause.
+ *
+ * A release is blocked when the contract is paused globally or when any of the
+ * reserve-relevant categories (`reservations`, `withdrawals`) is paused.
+ * Unknown categories are preserved by callers but never block a release on
+ * their own, so new contract capabilities do not silently disable treasury
+ * operations.
+ */
+export function isTreasuryReserveReleasePaused(
+  state?: TreasuryReserveContractPauseState | null
+): boolean {
+  if (!state) {
+    return false;
+  }
+  if (state.isPaused === true) {
+    return true;
+  }
+  const paused = new Set(normalizePausedCategories(state));
+  return TREASURY_RESERVE_RELEASE_BLOCKED_PAUSE_CATEGORIES.some((category) => paused.has(category));
+}
+
+/**
+ * Assert that treasury reserve releases are allowed by the contract pause state.
+ *
+ * Use this before building a release request when the caller wants to fail fast
+ * without a reserve snapshot. The thrown error is privacy-safe: it contains no
+ * amounts, salaries, or employee identifiers.
+ *
+ * @throws {TreasuryReserveReleaseValidationError} with code
+ * `TREASURY_RESERVE_CONTRACT_PAUSED` when the contract is paused.
+ */
+export function assertTreasuryReserveReleaseNotPaused(
+  state?: TreasuryReserveContractPauseState | null,
+  context: ErrorContext = {}
+): void {
+  if (!isTreasuryReserveReleasePaused(state)) {
+    return;
+  }
+
+  throw new TreasuryReserveReleaseValidationError(
+    TREASURY_RESERVE_RELEASE_PAUSED_MESSAGE,
+    TreasuryReserveReleaseValidationErrorCode.CONTRACT_PAUSED,
+    context,
+    {
+      isPaused: state?.isPaused === true,
+      pausedCategories: normalizePausedCategories(state),
+    }
+  );
+}
+
 /**
  * Validates a treasury reserve release request against the current reserve
  * snapshot and optional clock time.
@@ -138,13 +234,17 @@ function normalizeRoles(roles: unknown): string[] {
  * @param reserve - Current snapshot of the treasury reserve.
  * @param now - Optional current timestamp in milliseconds (defaults to Date.now()).
  * @param context - Optional debugging context.
+ * @param contractPauseState - Optional decoded contract pause state. When the
+ * contract is paused (globally or for `reservations`/`withdrawals`), the release
+ * is rejected with `TREASURY_RESERVE_CONTRACT_PAUSED`.
  * @returns Validation result describing the release.
  */
 export function validateTreasuryReserveRelease(
   request: TreasuryReserveReleaseRequest,
   reserve: TreasuryReserveSnapshot | null | undefined,
   now: number = Date.now(),
-  context: ErrorContext = {}
+  context: ErrorContext = {},
+  contractPauseState?: TreasuryReserveContractPauseState | null
 ): TreasuryReserveReleaseValidationResult {
   if (!reserve || typeof reserve !== "object") {
     throw new TreasuryReserveReleaseValidationError(
@@ -179,6 +279,18 @@ export function validateTreasuryReserveRelease(
       TreasuryReserveReleaseValidationErrorCode.UNKNOWN_RESERVE,
       { ...context, reserveId: request.reserveId },
       { requestedReserveId: request.reserveId, snapshotReserveId: reserve.reserveId }
+    );
+  }
+
+  if (isTreasuryReserveReleasePaused(contractPauseState)) {
+    throw new TreasuryReserveReleaseValidationError(
+      TREASURY_RESERVE_RELEASE_PAUSED_MESSAGE,
+      TreasuryReserveReleaseValidationErrorCode.CONTRACT_PAUSED,
+      { ...context, reserveId: request.reserveId },
+      {
+        isPaused: contractPauseState?.isPaused === true,
+        pausedCategories: normalizePausedCategories(contractPauseState),
+      }
     );
   }
 

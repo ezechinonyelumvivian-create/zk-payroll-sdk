@@ -7,3 +7,4 @@ export * from "./chunking";
 export * from "./contractBatchLimit";
 export * from "./batchExecutionDependencyValidator";
 export * from "./commitmentDuplicateValidator";
+export * from "./payoutRetryTotals";
