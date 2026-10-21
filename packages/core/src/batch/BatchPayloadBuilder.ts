@@ -3,11 +3,26 @@ import {
   isPaymentAssetCompatible,
   PAYMENT_ASSET_COMPATIBILITY_MESSAGE,
 } from "../assets/paymentAssetCompatibility";
+import {
+  findRemovedEmployeesInPayoutBatch,
+  type RemovedEmployeeGuardOptions,
+} from "../employees/removedEmployeeGuard";
 
 export interface BatchPaymentEntry {
   recipient: string;
   amount: bigint;
   asset: string;
+  /** Employee identifier, when the entry originates from a payroll employee. */
+  employeeId?: string;
+  /**
+   * Employment lifecycle status of the paying employee (e.g. `"active"`,
+   * `"removed"`). Removed employees are rejected by the batch builder.
+   */
+  employeeStatus?: string;
+  /** Explicit removal marker set when the employee was removed from the roster. */
+  isRemoved?: boolean;
+  /** Timestamp (ms, ISO string, or `Date`) recorded when the employee was removed. */
+  removedAt?: number | string | Date | null;
 }
 
 export interface BatchPayload {
@@ -21,14 +36,20 @@ export type BatchErrorCode =
   | "INVALID_AMOUNT"
   | "DUPLICATE_RECIPIENT"
   | "MISSING_ASSET"
-  | "INCOMPATIBLE_ASSET";
+  | "INCOMPATIBLE_ASSET"
+  | "REMOVED_EMPLOYEE";
 
 export interface BatchValidationError {
   code: BatchErrorCode;
   message: string;
   field: string;
   index?: number;
+  /** Masked employee identifier for `REMOVED_EMPLOYEE` errors, safe to display. */
+  redactedEmployeeId?: string;
 }
+
+/** Options for {@link BatchPayloadBuilder}. */
+export type BatchPayloadBuilderOptions = RemovedEmployeeGuardOptions;
 
 export class BatchValidationFailedError extends ZkPayrollError {
   constructor(public readonly validationErrors: BatchValidationError[]) {
@@ -43,8 +64,11 @@ export class BatchValidationFailedError extends ZkPayrollError {
  * Validates an array of batch payment entries.
  * Returns an array of structured BatchValidationError objects; empty array means valid.
  */
-export function validateBatchPayload(entries: BatchPaymentEntry[]): BatchValidationError[] {
-  const builder = new BatchPayloadBuilder();
+export function validateBatchPayload(
+  entries: BatchPaymentEntry[],
+  options: BatchPayloadBuilderOptions = {}
+): BatchValidationError[] {
+  const builder = new BatchPayloadBuilder(options);
   builder.addMany(entries);
   return builder.validate();
 }
@@ -60,6 +84,16 @@ export function validateBatchPayload(entries: BatchPaymentEntry[]): BatchValidat
  */
 export class BatchPayloadBuilder {
   private readonly entries: BatchPaymentEntry[] = [];
+  private readonly options: BatchPayloadBuilderOptions;
+
+  /**
+   * @param options Removal-guard options. By default entries flagged as
+   * belonging to removed employees are rejected; pass
+   * `rejectRemovedEmployees: false` only for reviewed offboarding settlements.
+   */
+  constructor(options: BatchPayloadBuilderOptions = {}) {
+    this.options = options;
+  }
 
   /** Appends a single payment entry to the batch. */
   add(entry: BatchPaymentEntry): this {
@@ -85,6 +119,7 @@ export class BatchPayloadBuilder {
    * - Each amount must be positive (> 0)
    * - Each asset must be a non-empty string
    * - No duplicate recipients within the same batch
+   * - No entries belonging to removed employees
    */
   validate(): BatchValidationError[] {
     const errors: BatchValidationError[] = [];
@@ -148,6 +183,16 @@ export class BatchPayloadBuilder {
           index: i,
         });
       }
+    }
+
+    for (const rejection of findRemovedEmployeesInPayoutBatch(this.entries, this.options)) {
+      errors.push({
+        code: "REMOVED_EMPLOYEE",
+        message: rejection.message,
+        field: "employeeId",
+        index: rejection.index,
+        redactedEmployeeId: rejection.redactedEmployeeId,
+      });
     }
 
     return errors;

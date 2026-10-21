@@ -1,5 +1,9 @@
 import { ZkPayrollError } from "../core/errors";
 import type { BatchPaymentEntry } from "./BatchPayloadBuilder";
+import {
+  findRemovedEmployeesInPayoutBatch,
+  type RemovedEmployeeGuardOptions,
+} from "../employees/removedEmployeeGuard";
 
 export interface EmployeeRecord {
   employeeId: string;
@@ -7,7 +11,19 @@ export interface EmployeeRecord {
   salary: bigint;
   asset: string;
   name?: string;
+  /**
+   * Employment lifecycle status (e.g. `"active"`, `"suspended"`, `"removed"`).
+   * Records carrying a removal status are rejected by the batch validator.
+   */
+  status?: string;
+  /** Explicit removal marker set when the employee was removed from the roster. */
+  isRemoved?: boolean;
+  /** Timestamp (ms, ISO string, or `Date`) recorded when the employee was removed. */
+  removedAt?: number | string | Date | null;
 }
+
+/** Options for {@link EmployeeBatchSchemaValidator}. */
+export type EmployeeBatchValidatorOptions = RemovedEmployeeGuardOptions;
 
 export interface EmployeeBatch {
   employees: EmployeeRecord[];
@@ -21,13 +37,16 @@ export type EmployeeBatchErrorCode =
   | "INVALID_RECIPIENT"
   | "DUPLICATE_RECIPIENT"
   | "INVALID_SALARY"
-  | "MISSING_ASSET";
+  | "MISSING_ASSET"
+  | "REMOVED_EMPLOYEE";
 
 export interface EmployeeBatchValidationError {
   code: EmployeeBatchErrorCode;
   message: string;
   field: string;
   index?: number;
+  /** Masked employee identifier for `REMOVED_EMPLOYEE` errors, safe to display. */
+  redactedEmployeeId?: string;
 }
 
 export class EmployeeBatchValidationFailedError extends ZkPayrollError {
@@ -39,22 +58,39 @@ export class EmployeeBatchValidationFailedError extends ZkPayrollError {
   }
 }
 
-export function validateEmployeeBatch(employees: EmployeeRecord[]): EmployeeBatchValidationError[] {
-  const validator = new EmployeeBatchSchemaValidator();
+export function validateEmployeeBatch(
+  employees: EmployeeRecord[],
+  options: EmployeeBatchValidatorOptions = {}
+): EmployeeBatchValidationError[] {
+  const validator = new EmployeeBatchSchemaValidator(options);
   validator.addMany(employees);
   return validator.validate();
 }
 
 export function convertToBatchPaymentEntries(employees: EmployeeRecord[]): BatchPaymentEntry[] {
   return employees.map((emp) => ({
+    employeeId: emp.employeeId,
     recipient: emp.recipient,
     amount: emp.salary,
     asset: emp.asset,
+    ...(emp.status !== undefined ? { employeeStatus: emp.status } : {}),
+    ...(emp.isRemoved !== undefined ? { isRemoved: emp.isRemoved } : {}),
+    ...(emp.removedAt !== undefined ? { removedAt: emp.removedAt } : {}),
   }));
 }
 
 export class EmployeeBatchSchemaValidator {
   private readonly employees: EmployeeRecord[] = [];
+  private readonly options: EmployeeBatchValidatorOptions;
+
+  /**
+   * @param options Removal-guard options. By default employees flagged as
+   * removed are rejected; pass `rejectRemovedEmployees: false` only for
+   * reviewed offboarding settlements.
+   */
+  constructor(options: EmployeeBatchValidatorOptions = {}) {
+    this.options = options;
+  }
 
   add(employee: EmployeeRecord): this {
     this.employees.push({ ...employee });
@@ -145,6 +181,16 @@ export class EmployeeBatchSchemaValidator {
           index: i,
         });
       }
+    }
+
+    for (const rejection of findRemovedEmployeesInPayoutBatch(this.employees, this.options)) {
+      errors.push({
+        code: "REMOVED_EMPLOYEE",
+        message: rejection.message,
+        field: "employeeId",
+        index: rejection.index,
+        redactedEmployeeId: rejection.redactedEmployeeId,
+      });
     }
 
     return errors;

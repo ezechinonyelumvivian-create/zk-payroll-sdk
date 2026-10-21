@@ -112,6 +112,14 @@ if (!report.valid) {
 }
 ```
 
+## Removed Employee Payout Batch Guard (#812)
+
+Removed employees must not receive a regular payroll payout. Both payout batch builders — `EmployeeBatchSchemaValidator` and `BatchPayloadBuilder` — reject entries that carry a removal signal (`status`/`employeeStatus` of `removed`, `offboarded`, or `terminated`, `isRemoved: true`, or a `removedAt` timestamp) and entries listed in a `removedEmployeeIds` roster snapshot.
+
+Each rejection is privacy-safe: the employee identifier is masked (`EMP***042`), salaries and payout destinations are never included, and the thrown `RemovedEmployeeInPayoutBatchError` reports only an aggregate count plus structured rejections.
+
+Use `partitionPayoutBatchByRemoval` to pay everyone else and surface skipped employees for review, or `rejectRemovedEmployees: false` on the builder for a reviewed offboarding settlement. See [removed-employee-batch-guard.md](../packages/core/docs/removed-employee-batch-guard.md) for the full reference.
+
 ## Treasury Liquidity Forecast Safeguards (#698)
 
 Payroll runs must not drain the treasury below operational minima. The SDK projects per-asset unreserved balances forward across a ledger horizon, applying scheduled cash flows and payroll obligations, and reports the earliest ledger at which any asset would breach its minimum.
